@@ -2920,6 +2920,24 @@ index 000000000..396908463
 +    module_name, _ = parse_fine_tuned_lora_name(peft_name, mapper)
 +
 +    assert module_name == expected_module
+diff --git a/tests/models/test_qwen3_5_mtp_pp.py b/tests/models/test_qwen3_5_mtp_pp.py
+new file mode 100644
+index 000000000..354e3fbe8
+--- /dev/null
++++ b/tests/models/test_qwen3_5_mtp_pp.py
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The Qwen3.5 MTP drafters declare SupportsPP (#46994), so a PP > 1 target
++passes the draft-model registry check."""
++
++from vllm.model_executor.models.interfaces import supports_pp
++from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
++
++
++def test_qwen3_5_mtp_supports_pp():
++    assert supports_pp(Qwen3_5MTP)
++    assert supports_pp(Qwen3_5MoeMTP)
 diff --git a/tests/models/test_qwen3_next_xpu_qkv.py b/tests/models/test_qwen3_next_xpu_qkv.py
 new file mode 100644
 index 000000000..ceafe873b
@@ -6502,6 +6520,44 @@ index 000000000..002cace5c
 +
 +    assert client.vllm_config.cache_config.block_size == 64
 +    assert client.vllm_config.cache_config.mamba_block_size == 32
+diff --git a/tests/v1/worker/test_mamba_hybrid_model_state.py b/tests/v1/worker/test_mamba_hybrid_model_state.py
+new file mode 100644
+index 000000000..42c4c7c9f
+--- /dev/null
++++ b/tests/v1/worker/test_mamba_hybrid_model_state.py
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++
++
++@pytest.mark.skipif(
++    not (current_platform.is_cuda() or current_platform.is_xpu()),
++    reason="Requires CUDA or XPU",
++)
++@pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
++def test_postprocess_state_scalar_with_int32_mapping(
++    num_sampled: int, expected_value: int
++) -> None:
++    state = object.__new__(MambaHybridModelState)
++    state.num_accepted_tokens_gpu = torch.full(
++        (4,), 9, dtype=torch.int32, device=current_platform.device_type
++    )
++    state._align_mode = False
++    state._mamba_ctx = None
++    idx_mapping = torch.tensor([2, -1, 0], dtype=torch.int32, device=current_platform.device_type)
++
++    state.postprocess_state(idx_mapping, num_sampled)
++
++    expected = torch.tensor(
++        [expected_value, 9, expected_value, 9], dtype=torch.int32, device=current_platform.device_type
++    )
++    torch.testing.assert_close(state.num_accepted_tokens_gpu, expected)
 diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
 index 4bbab10b4..bc574ece1 100644
 --- a/tests/v1/worker/test_mamba_utils.py
@@ -6609,6 +6665,187 @@ index 4bbab10b4..bc574ece1 100644
  def _make_postprocess_scheduler_output(
      req_ids: list[str],
      num_scheduled_tokens: dict[str, int],
+diff --git a/tests/v1/worker/test_mrv2_uniform_decode_prefill.py b/tests/v1/worker/test_mrv2_uniform_decode_prefill.py
+new file mode 100644
+index 000000000..07f2d7146
+--- /dev/null
++++ b/tests/v1/worker/test_mrv2_uniform_decode_prefill.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A prompt of exactly 1 + num_spec_tokens tokens must not be treated as a
++uniform decode batch (it would replay the spec-decode graph, #51865)."""
++
++from types import SimpleNamespace
++
++import numpy as np
++
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++
++
++def _runner(prefill_len, num_computed_prefill):
++    req_states = SimpleNamespace(
++        req_id_to_index={"a": 0, "b": 1},
++        prefill_len=SimpleNamespace(np=np.array(prefill_len, dtype=np.int32)),
++        num_computed_prefill_tokens=np.array(num_computed_prefill, dtype=np.int32),
++    )
++    return SimpleNamespace(req_states=req_states)
++
++
++def _sched(*req_ids):
++    return SimpleNamespace(num_scheduled_tokens={r: 5 for r in req_ids})
++
++
++def test_prefill_request_is_detected():
++    # "a" is a fresh 5-token prompt, same shape as a 1 + 4 spec decode row.
++    runner = _runner(prefill_len=[5, 20], num_computed_prefill=[0, 20])
++    assert GPUModelRunner._batch_has_prefill(runner, _sched("a"))
++    assert GPUModelRunner._batch_has_prefill(runner, _sched("a", "b"))
++
++
++def test_decode_only_batch():
++    runner = _runner(prefill_len=[5, 20], num_computed_prefill=[5, 20])
++    assert not GPUModelRunner._batch_has_prefill(runner, _sched("a", "b"))
+diff --git a/tests/v1/worker/test_pp_utils.py b/tests/v1/worker/test_pp_utils.py
+new file mode 100644
+index 000000000..bf9c81619
+--- /dev/null
++++ b/tests/v1/worker/test_pp_utils.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which rows the PP sampled-token broadcast must carry."""
++
++import os
++import tempfile
++from unittest.mock import Mock
++
++import numpy as np
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++
++from vllm.v1.worker.gpu import pp_utils
++
++
++def _batch(num_computed, prefill_len, num_scheduled):
++    return Mock(
++        num_reqs=len(num_computed),
++        num_computed_tokens_np=np.array(num_computed, dtype=np.int32),
++        prefill_len_np=np.array(prefill_len, dtype=np.int32),
++        num_scheduled_tokens=np.array(num_scheduled, dtype=np.int32),
++    )
++
++
++def test_excludes_non_final_prefill_chunks():
++    """Unchanged behaviour: a chunk that does not finish its prefill is skipped."""
++    # Row 0 is a middle prefill chunk and produces no sample; row 1 finishes its
++    # prefill this step and therefore does.
++    batch = _batch(
++        num_computed=[512, 1000],
++        prefill_len=[4096, 1004],
++        num_scheduled=[448, 4],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [False, True]
++
++
++def test_none_when_no_row_samples():
++    """Unchanged behaviour: an all-prefill batch needs no broadcast at all."""
++    batch = _batch(
++        num_computed=[0, 512],
++        prefill_len=[4096, 4096],
++        num_scheduled=[448, 448],
++    )
++
++    assert pp_utils.compute_need_sampled_mask(batch) is None
++
++
++def test_keeps_decoding_request_past_its_length_cap():
++    """A decoding request must never be dropped from the broadcast.
++
++    Speculative decoding advances `num_computed_tokens` several tokens per step,
++    so it can overrun `prompt_len + max_tokens` while the scheduler is still
++    running the request. Predicting "this one is finishing" and skipping its
++    broadcast freezes the earlier pipeline stages' `last_sampled_tokens` and
++    `draft_tokens` while the last rank keeps advancing its own, and the stages
++    then diverge permanently.
++    """
++    batch = _batch(
++        # 14176 computed tokens is already past this request's own
++        # prompt_len + max_tokens; the scheduler is still running it.
++        num_computed=[14176],
++        prefill_len=[12175],
++        num_scheduled=[8],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [True]
++
++
++def test_decode_row_ahead_of_a_prefill_chunk():
++    """Row order does not matter: only whether the row finishes its prefill."""
++    batch = _batch(
++        num_computed=[10, 512],
++        prefill_len=[8, 4096],
++        num_scheduled=[1, 448],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [True, False]
++
++
++class _Ready:
++    def synchronize(self) -> None:
++        pass
++
++
++def _host_broadcast_worker(rank: int, init_file: str, steps: list) -> None:
++    dist.init_process_group(
++        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
++    )
++    host = pp_utils._HostBroadcaster(src=1, group=dist.group.WORLD)
++    if rank == 1:
++        for packed, drafts in steps:
++            host.send(packed.clone(), _Ready())
++            host.send(drafts.clone(), _Ready())
++        host.submit(lambda: None).result(timeout=30)
++    else:
++        futures = [
++            host.recv(torch.empty_like(packed), torch.empty_like(drafts))
++            for packed, drafts in steps
++        ]
++        for fut, (packed, drafts) in zip(futures, steps):
++            got_packed, got_drafts = fut.result(timeout=30)
++            assert torch.equal(got_packed, packed)
++            assert torch.equal(got_drafts, drafts)
++    dist.destroy_process_group()
++
++
++def test_host_broadcaster_matches_steps_in_order():
++    """The XPU gloo path pairs per-step (sampled, drafts) sends with receives
++    posted ahead of time, in submission order, with different batch sizes."""
++    steps = [
++        (torch.arange(n * 7, dtype=torch.int64).view(n, 7) + 100 * i,
++         torch.arange(n * 4, dtype=torch.int64).view(n, 4) - 100 * i)
++        for i, n in enumerate([3, 1, 5])
++    ]
++    with tempfile.TemporaryDirectory() as d:
++        init_file = os.path.join(d, "init")
++        mp.start_processes(
++            _host_broadcast_worker,
++            args=(init_file, steps),
++            nprocs=2,
++            join=True,
++            start_method="spawn",
++        )
 diff --git a/tests/v1/worker/test_qwen3_next_plain_mrope.py b/tests/v1/worker/test_qwen3_next_plain_mrope.py
 new file mode 100644
 index 000000000..d7ade31a3
@@ -6959,7 +7196,7 @@ index 8875ed49f..171a12ab0 100644
  
      @staticmethod
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 8ba55a2ec..fb93968d2 100644
+index 8ba55a2ec..73dced75e 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
 @@ -877,7 +877,11 @@ class SpeculativeConfig:
@@ -6975,6 +7212,15 @@ index 8ba55a2ec..fb93968d2 100644
                      self.method = "dflash"
                  elif (
                      "dspark" in self.draft_model_config.model.lower()
+@@ -1193,7 +1197,7 @@ class SpeculativeConfig:
+         This is mostly a copy of the target parallel config, except the tp_size.
+         """
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            pipeline_parallel_size=1,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
 @@ -1330,6 +1334,20 @@ class SpeculativeConfig:
      def use_dflash(self) -> bool:
          return self.method == "dflash"
@@ -7088,7 +7334,7 @@ index 1b6ce9e8a..4c2f8141d 100644
  
      def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
-index f0647323e..23e1b76a1 100644
+index f0647323e..6762dd069 100644
 --- a/vllm/distributed/parallel_state.py
 +++ b/vllm/distributed/parallel_state.py
 @@ -504,6 +504,7 @@ class GroupCoordinator:
@@ -7099,7 +7345,27 @@ index f0647323e..23e1b76a1 100644
  
          self.use_cpu_custom_send_recv = (
              current_platform.is_cpu()
-@@ -657,7 +658,12 @@ class GroupCoordinator:
+@@ -533,6 +534,19 @@ class GroupCoordinator:
+         assert sibling is not None
+         return sibling
+ 
++    def make_sibling_cpu_group(self, group_desc: str | None = None) -> ProcessGroup:
++        """Like `make_sibling_device_group`, but backed by gloo. Collective
++        call: every world rank must invoke it."""
++        sibling: ProcessGroup | None = None
++        for ranks in self.group_ranks:
++            pg = torch.distributed.new_group(
++                ranks, backend="gloo", group_desc=group_desc
++            )
++            if self.rank in ranks:
++                sibling = pg
++        assert sibling is not None
++        return sibling
++
+     def create_mq_broadcaster(
+         self, writer_rank=0, external_writer_handle=None, blocking=True
+     ):
+@@ -657,7 +671,12 @@ class GroupCoordinator:
          if self.world_size == 1:
              return input_
  
@@ -7129,10 +7395,19 @@ index a931b2305..c9dc1986f 100644
  
  import torch
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 67d8fa5a2..698963fd9 100755
+index 67d8fa5a2..68ddaab52 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -291,6 +291,14 @@ if TYPE_CHECKING:
+@@ -61,6 +61,8 @@ if TYPE_CHECKING:
+     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
+     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
++    VLLM_XPU_PP_MICROBATCH: bool = True
++    VLLM_XPU_PP_HOST_BROADCAST: bool = True
+     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
+     VLLM_XLA_USE_SPMD: bool = False
+@@ -291,6 +293,14 @@ if TYPE_CHECKING:
      VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -7147,7 +7422,24 @@ index 67d8fa5a2..698963fd9 100755
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
      VLLM_GPU_NIC_PCIE_MAPPING: str = ""
      VLLM_NIC_SELECTION_VARS: str = ""
-@@ -1998,6 +2006,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -896,6 +906,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_RAY_WRAPPED_PP_COMM": lambda: bool(
+         int(os.getenv("VLLM_USE_RAY_WRAPPED_PP_COMM", "1"))
+     ),
++    # Using a flag to control microbatch on XPU device, users on XPU device can
++    # decide to disable it when they needed.
++    "VLLM_XPU_PP_MICROBATCH": lambda: bool(
++        int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
++    ),
++    # On XPU, send the MRV2 PP sampled/draft token broadcast over a gloo group
++    # from a helper thread instead of a second xccl communicator.
++    "VLLM_XPU_PP_HOST_BROADCAST": lambda: bool(
++        int(os.getenv("VLLM_XPU_PP_HOST_BROADCAST", "1"))
++    ),
+     # When True and distributed_executor_backend="ray", use RayExecutorV2
+     # (MQ-based) instead of RayDistributedExecutor (compiled-graph backend).
+     "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": lambda: bool(
+@@ -1998,6 +2018,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
          int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
      ),
@@ -16688,6 +16980,57 @@ index bcd2576b7..b64901ee4 100644
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
          # protocols have not __init__ method, so we need to use nn.Module.__init__
          nn.Module.__init__(self)
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 0620509f2..6f420c270 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -36,6 +36,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+ from .interfaces import (
+     MultiModalEmbeddings,
+     SupportsMultiModal,
++    SupportsPP,
+     _require_is_multimodal,
+ )
+ from .utils import (
+@@ -136,7 +137,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         inputs_embeds: torch.Tensor | None = None,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor:
+-        if get_pp_group().is_first_rank:
++        # Branch on the inputs, not the rank: the drafter is built entirely on
++        # the last PP stage, where `is_first_rank` is False.
++        if intermediate_tensors is None:
+             if inputs_embeds is None:
+                 inputs_embeds = self.embed_input_ids(input_ids)
+             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+@@ -146,7 +149,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+             hidden_states = self.fc(hidden_states)
+             residual = None
+         else:
+-            assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+@@ -199,7 +201,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         "hidden_states": 0,
+     }
+ )
+-class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
++class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -242,6 +244,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+ 
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors
++        )
++
+     def embed_input_ids(
+         self,
+         input_ids: torch.Tensor,
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
 index bf5ea501c..42abbcbd2 100644
 --- a/vllm/model_executor/models/qwen3_dflash.py
@@ -20264,6 +20607,42 @@ index c6e38c7fb..ccf103988 100644
  def compute_mm_prefix_range_tensor(
      mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
      num_seqs: int,
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index d1c652c46..3918160a0 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.platforms import current_platform
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.core.sched.scheduler import Scheduler
+ from vllm.v1.request import Request, RequestStatus
+@@ -15,6 +17,10 @@ class AsyncScheduler(Scheduler):
+         # reusable read-only placeholder list for speculative decoding.
+         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+         self.pp_size = self.parallel_config.pipeline_parallel_size
++        # Only XPU can disable PP decode microbatching via VLLM_XPU_PP_MICROBATCH.
++        self.decode_stagger = self.pp_size
++        if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
++            self.decode_stagger = 1
+ 
+     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+         super()._update_after_schedule(scheduler_output)
+@@ -46,7 +52,9 @@ class AsyncScheduler(Scheduler):
+             if self.use_v2_model_runner:
+                 # Set the next step index in which this request is eligible to be
+                 # scheduled for decode (for PP microbatching).
+-                request.next_decode_eligible_step = self.current_step + self.pp_size
++                request.next_decode_eligible_step = (
++                    self.current_step + self.decode_stagger
++                )
+ 
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int]
 diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
 index 919402a16..7bd622d90 100644
 --- a/vllm/v1/engine/__init__.py
@@ -20528,7 +20907,7 @@ index a97a4e395..926aa5483 100644
                  attn_metadata[layer_name] = metadata
      return attn_metadata
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 293b06ff9..75fe1566b 100644
+index 293b06ff9..e12c7eb84 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -36,7 +36,11 @@ from vllm.distributed.parallel_state import (
@@ -20572,7 +20951,47 @@ index 293b06ff9..75fe1566b 100644
  
  class GPUModelRunner(LoRAModelRunnerMixin):
      def __init__(self, vllm_config: VllmConfig, device: torch.device):
-@@ -1347,6 +1372,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -784,7 +809,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # For non-last PP ranks, update decode requests with sampler output from
+         # the prior step in which they were scheduled (pp_size steps ago).
+         if self.pp_handler is not None:
+-            outputs = self.pp_handler.get_prev_sampled_outputs()
++            outputs = self.pp_handler.get_prev_sampled_outputs(
++                self.req_states.draft_tokens
++            )
+             if outputs is not None:
+                 self.postprocess_sampled(**outputs)
+ 
+@@ -871,6 +898,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 scheduler_output.kv_cache_block_copies,
+             )
+ 
++    def _batch_has_prefill(self, scheduler_output: SchedulerOutput) -> bool:
++        idx = [
++            self.req_states.req_id_to_index[req_id]
++            for req_id in scheduler_output.num_scheduled_tokens
++        ]
++        computed = self.req_states.num_computed_prefill_tokens[idx]
++        return bool(np.any(computed < self.req_states.prefill_len.np[idx]))
++
+     def prepare_inputs(
+         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+     ) -> InputBatch:
+@@ -1174,6 +1209,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
++        if (
++            uniform_tok_count is not None
++            and not dummy_run
++            and self._batch_has_prefill(scheduler_output)
++        ):
++            # Only decode batches may replay uniform-decode graphs (#51865).
++            uniform_tok_count = None
+ 
+         num_active_loras = 0
+         if self.lora_config:
+@@ -1347,6 +1389,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  skip_compiled=skip_compiled,
                  is_padding=input_batch.is_padding,
              ):
@@ -20588,6 +21007,466 @@ index 293b06ff9..75fe1566b 100644
                  self.kv_connector.pre_forward(scheduler_output)
                  if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                      # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+@@ -1472,7 +1523,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+-        if self.speculator is not None and self.speculator.supports_mm_inputs:
++        # The encoder runner exists only on the first PP rank, so later ranks
++        # have no cached embeddings to gather.
++        if (
++            self.speculator is not None
++            and self.speculator.supports_mm_inputs
++            and self.model_state.supports_mm_inputs
++        ):
+             # Get cached multimodal embeddings for draft forward.
+             # NOTE: This is done here because postprocess updates
+             # num_computed_prefill_tokens.
+@@ -1527,6 +1584,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
++            if self.pp_handler is not None:
++                self.pp_handler.broadcast_drafts(
++                    self.req_states.draft_tokens, input_batch
++                )
+ 
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index d04400afa..8f7aff7c7 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -301,18 +301,20 @@ class MambaHybridModelState(DefaultModelState):
+     ) -> None:
+         # Chunked prefill does not sample a token, so num_sampled can be 0.
+         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
++        num_reqs = idx_mapping.shape[0]
++        if not num_reqs:
++            return
++
+         if not isinstance(num_sampled, int):
+             # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
+             # kernel skips them rather than scattering with a host-side gather.
+-            n = idx_mapping.shape[0]
+-            if n:
+-                _scatter_num_accepted_kernel[(n,)](
+-                    idx_mapping, num_sampled, self.num_accepted_tokens_gpu
+-                )
++            _scatter_num_accepted_kernel[(num_reqs,)](
++                idx_mapping, num_sampled, self.num_accepted_tokens_gpu
++            )
+         else:
+             # Fill with single value.
+-            self.num_accepted_tokens_gpu.index_fill_(
+-                0, idx_mapping, max(num_sampled, 1)
++            _fill_num_accepted_kernel[(num_reqs,)](
++                idx_mapping, self.num_accepted_tokens_gpu, max(num_sampled, 1)
+             )
+ 
+         # Align: save the running state to the block-aligned position when
+@@ -324,15 +326,13 @@ class MambaHybridModelState(DefaultModelState):
+             and num_computed_tokens is not None
+             and self._mamba_ctx is not None
+         ):
+-            num_reqs = idx_mapping.shape[0]
+-            if num_reqs:
+-                self._mamba_ctx.run_fused_postprocess_align(
+-                    num_reqs,
+-                    self.num_accepted_tokens_gpu,
+-                    self._mamba_state_idx_gpu,
+-                    num_computed_tokens,
+-                    idx_mapping,
+-                )
++            self._mamba_ctx.run_fused_postprocess_align(
++                num_reqs,
++                self.num_accepted_tokens_gpu,
++                self._mamba_state_idx_gpu,
++                num_computed_tokens,
++                idx_mapping,
++            )
+ 
+ 
+ @triton.jit
+@@ -347,3 +347,16 @@ def _scatter_num_accepted_kernel(
+         return
+     num_sampled = tl.load(num_sampled_ptr + row)
+     tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
++
++
++@triton.jit
++def _fill_num_accepted_kernel(
++    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
++    num_accepted_ptr,  # [max_num_reqs]
++    num_sampled,
++):
++    row = tl.program_id(0)
++    req_state_idx = tl.load(idx_mapping_ptr + row)
++    if req_state_idx < 0:
++        return
++    tl.store(num_accepted_ptr + req_state_idx, num_sampled)
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe..752dc59d6 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -2,14 +2,20 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
++import queue
++import threading
+ from collections import deque
++from collections.abc import Callable
++from concurrent.futures import Future
+ from dataclasses import dataclass
+ 
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.platforms import current_platform
++from vllm.utils.platform_utils import is_pin_memory_available
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
+@@ -18,11 +24,12 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
+ class PendingRecv:
+     """Per-step slot data for a deferred postprocess on the main stream."""
+ 
+-    event: torch.cuda.Event
++    # None when the outputs arrive through `host_future` (host broadcast).
++    event: torch.cuda.Event | None
+ 
+-    sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
+-    num_sampled: torch.Tensor  # [num_reqs]
+-    num_rejected: torch.Tensor  # [num_reqs]
++    sampled_tokens: torch.Tensor | None  # [num_reqs, max_sample_len]
++    num_sampled: torch.Tensor | None  # [num_reqs]
++    num_rejected: torch.Tensor | None  # [num_reqs]
+     idx_mapping: torch.Tensor  # [num_reqs]
+     idx_mapping_np: np.ndarray  # [num_reqs]
+     # Records which rows need a deferred postprocess (bool).
+@@ -30,23 +37,72 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
++    # Host broadcast: resolves to (packed[, drafts]) CPU tensors, where
++    # packed = [sampled_tokens | num_sampled | num_rejected].
++    host_future: Future | None = None
++
++
++class _HostBroadcaster:
++    """Runs gloo broadcasts in submission order on one daemon thread.
++
++    Both PP ends submit their broadcasts in the same per-step order, so the
++    single FIFO thread keeps them matched without blocking the main thread.
++    """
++
++    def __init__(self, src: int, group: torch.distributed.ProcessGroup):
++        self.src = src
++        self.group = group
++        self.tasks: queue.SimpleQueue[tuple[Callable[[], object], Future]] = (
++            queue.SimpleQueue()
++        )
++        self.thread = threading.Thread(
++            target=self._run, name="pp_host_broadcast", daemon=True
++        )
++        self.thread.start()
++
++    def _run(self) -> None:
++        while True:
++            fn, fut = self.tasks.get()
++            try:
++                fut.set_result(fn())
++            except BaseException as e:  # noqa: BLE001
++                fut.set_exception(e)
++
++    def submit(self, fn: Callable[[], object]) -> Future:
++        fut: Future = Future()
++        self.tasks.put((fn, fut))
++        return fut
++
++    def send(self, tensor: torch.Tensor, ready: torch.cuda.Event) -> None:
++        """Broadcast a pinned CPU tensor once `ready` (its D2H copy) completes."""
++
++        def _send() -> None:
++            ready.synchronize()
++            torch.distributed.broadcast(tensor, src=self.src, group=self.group)
++
++        self.submit(_send)
++
++    def recv(self, *tensors: torch.Tensor) -> Future:
++        def _recv() -> tuple[torch.Tensor, ...]:
++            for t in tensors:
++                torch.distributed.broadcast(t, src=self.src, group=self.group)
++            return tensors
++
++        return self.submit(_recv)
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+-    with outputs that might be needed in a subsequent (decode) step.
+-    Returns None if no sampled outputs are needed in the requests' next step."""
++    that produce a sampled token this step, and therefore must have that token
++    (and the draft block proposed from it) propagated to the earlier PP stages.
++    Returns None if no request in the batch produces a sample."""
+ 
+     old_computed = input_batch.num_computed_tokens_np
+     prefill_len = input_batch.prefill_len_np
+-    max_seq_len = input_batch.max_seq_len_np
+-    assert max_seq_len is not None  # always populated under PP
+     # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+-    # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
+-    need_sampled_mask = produces_sample & not_finishing
+-    return need_sampled_mask if need_sampled_mask.any() else None
++    return produces_sample if produces_sample.any() else None
+ 
+ 
+ class PPHandler:
+@@ -65,6 +121,7 @@ class PPHandler:
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        self.num_speculative_steps = num_speculative_steps
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -73,8 +130,12 @@ class PPHandler:
+         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
+         # with pp_size None placeholders so the first pp_size consumes are no-ops.
+         # None means no postprocess is pending for that step (broadcast skipped).
++        # Only XPU can disable microbatching via VLLM_XPU_PP_MICROBATCH.
++        ring_depth = get_pp_group().world_size
++        if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
++            ring_depth = 1
+         self.queue: deque[PendingRecv | None] = (
+-            deque() if self.is_last_rank else deque([None] * get_pp_group().world_size)
++            deque() if self.is_last_rank else deque([None] * ring_depth)
+         )
+ 
+         # Per req-index generation counter, incremented every time a request
+@@ -82,6 +143,20 @@ class PPHandler:
+         # between PP decodes.
+         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
+ 
++        # On XPU (oneCCL 2021.15), a second xccl communicator for these small
++        # broadcasts deadlocks with the hidden-state send/recv under load, so
++        # they go over a gloo group from a helper thread instead.
++        self.host: _HostBroadcaster | None = None
++        if current_platform.is_xpu() and envs.VLLM_XPU_PP_HOST_BROADCAST:
++            self.pin_memory = is_pin_memory_available()
++            # Keeps pinned buffers alive until their async H2D/D2H copies finish.
++            self.host_buffers: deque[torch.Tensor] = deque(maxlen=64)
++            self.host = _HostBroadcaster(
++                self.last_rank,
++                get_pp_group().make_sibling_cpu_group(group_desc="pp_broadcast"),
++            )
++            return
++
+         # Dedicated subgroup for the sampled-token broadcast.
+         self.broadcast_group = get_pp_group().make_sibling_device_group(
+             group_desc="pp_broadcast"
+@@ -90,7 +165,9 @@ class PPHandler:
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
++    def get_prev_sampled_outputs(
++        self, draft_tokens_to_update: torch.Tensor | None = None
++    ) -> dict[str, torch.Tensor] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+         """
+@@ -115,7 +192,22 @@ class PPHandler:
+             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+ 
+-        self.main_stream.wait_event(slot.event)
++        if slot.host_future is not None:
++            self._materialize_host_slot(slot)
++        else:
++            self.main_stream.wait_event(slot.event)
++        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
++            draft_tokens = slot.draft_tokens
++            draft_idx_mapping = slot.idx_mapping
++            if exclude_mask.any():
++                keep = ~exclude_mask
++                keep_t = torch.as_tensor(keep, device=self.device)
++                draft_tokens = draft_tokens[keep_t]
++                draft_idx_mapping = async_copy_to_gpu(
++                    slot.idx_mapping_np[keep], device=self.device
++                )
++            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
++
+         return dict(
+             sampled_tokens=slot.sampled_tokens,
+             num_sampled=slot.num_sampled,
+@@ -123,6 +215,56 @@ class PPHandler:
+             idx_mapping=idx_mapping,
+         )
+ 
++    def _to_host(self, tensor: torch.Tensor) -> torch.Tensor:
++        """Async D2H copy into a pinned buffer; returns the buffer."""
++        buf = torch.empty(
++            tensor.shape, dtype=tensor.dtype, pin_memory=self.pin_memory
++        )
++        buf.copy_(tensor, non_blocking=True)
++        return buf
++
++    def _host_send(self, tensor: torch.Tensor) -> None:
++        assert self.host is not None
++        buf = self._to_host(tensor)
++        ready = self.main_stream.record_event()
++        self.host.send(buf, ready)
++
++    def _materialize_host_slot(self, slot: PendingRecv) -> None:
++        assert slot.host_future is not None
++        received = slot.host_future.result()
++        packed_cpu = received[0]
++        drafts_cpu = received[1] if len(received) > 1 else None
++        packed = packed_cpu.to(self.device, non_blocking=True)
++        self.host_buffers.append(packed_cpu)
++        n = self.max_sample_len
++        slot.sampled_tokens = packed[:, :n].contiguous()
++        slot.num_sampled = packed[:, n].to(torch.int32)
++        slot.num_rejected = packed[:, n + 1].to(torch.int32)
++        if drafts_cpu is not None:
++            slot.draft_tokens = drafts_cpu.to(self.device, non_blocking=True)
++            self.host_buffers.append(drafts_cpu)
++        slot.host_future = None
++
++    def broadcast_drafts(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Broadcast draft proposals so non-last ranks can embed real token ids."""
++        assert self.is_last_rank
++        if compute_need_sampled_mask(input_batch) is None:
++            return
++        if self.host is not None:
++            self._host_send(draft_tokens[input_batch.idx_mapping])
++            return
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            send = draft_tokens[input_batch.idx_mapping].contiguous()
++            # Must record the idx_mapping tensor since it was allocated
++            # on the main stream.
++            input_batch.idx_mapping.record_stream(self.broadcast_stream)
++            torch.distributed.broadcast(
++                send, src=self.last_rank, group=self.broadcast_group
++            )
++
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+@@ -137,6 +279,37 @@ class PPHandler:
+         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+ 
+         num_reqs = input_batch.num_reqs
++        if self.host is not None:
++            packed = torch.empty(
++                num_reqs,
++                self.max_sample_len + 2,
++                dtype=torch.int64,
++                pin_memory=self.pin_memory,
++            )
++            recv_tensors = [packed]
++            if self.num_speculative_steps > 0:
++                recv_tensors.append(
++                    torch.empty(
++                        num_reqs,
++                        self.num_speculative_steps,
++                        dtype=torch.int64,
++                        pin_memory=self.pin_memory,
++                    )
++                )
++            host_future = self.host.recv(*recv_tensors)
++            self.queue[-1] = PendingRecv(
++                None,
++                None,
++                None,
++                None,
++                input_batch.idx_mapping,
++                input_batch.idx_mapping_np,
++                need_sampled_mask,
++                gen_at_receive_np,
++                host_future=host_future,
++            )
++            return bool(need_sampled_mask.all())
++
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+             sampled_tokens = torch.empty(
+@@ -149,12 +322,25 @@ class PPHandler:
+             torch.distributed.broadcast(
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
++            draft_tokens = None
++            if self.num_speculative_steps > 0:
++                draft_tokens = torch.empty(
++                    num_reqs,
++                    self.num_speculative_steps,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +350,7 @@ class PPHandler:
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -181,13 +368,30 @@ class PPHandler:
+ 
+         assert sampled_token_ids.dtype == torch.int64
+ 
++        if self.host is not None:
++            pad = self.max_sample_len - sampled_token_ids.shape[-1]
++            packed = torch.cat(
++                (
++                    torch.nn.functional.pad(sampled_token_ids, (0, pad)),
++                    num_sampled.to(torch.int64).unsqueeze(1),
++                    num_rejected.to(torch.int64).unsqueeze(1),
++                ),
++                dim=1,
++            )
++            self._host_send(packed)
++            return
++
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+ 
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            send_tokens = torch.nn.functional.pad(
++                sampled_token_ids,
++                (0, self.max_sample_len - sampled_token_ids.shape[-1]),
++            )
+             torch.distributed.broadcast(
+-                sampled_token_ids.contiguous(),
++                send_tokens.contiguous(),
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
 index 478274a05..b9e6ea02f 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
