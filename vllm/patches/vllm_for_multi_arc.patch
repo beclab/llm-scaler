@@ -6520,6 +6520,63 @@ index 000000000..002cace5c
 +
 +    assert client.vllm_config.cache_config.block_size == 64
 +    assert client.vllm_config.cache_config.mamba_block_size == 32
+diff --git a/tests/v1/worker/test_draft_lm_head_int4.py b/tests/v1/worker/test_draft_lm_head_int4.py
+new file mode 100644
+index 000000000..322e02271
+--- /dev/null
++++ b/tests/v1/worker/test_draft_lm_head_int4.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Int4 copy of a shared lm_head for the drafter (draft_lm_head_quantization)."""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    INT4_GROUP_SIZE,
++    _LMHeadInt4Method,
++    dequantize_int4_gptq,
++    quantize_int4_gptq,
++)
++from vllm.platforms import current_platform
++
++
++def test_int4_quantize_round_trip_within_half_step():
++    torch.manual_seed(0)
++    w = torch.randn(300, 512, dtype=torch.float16)
++    qweight, scales = quantize_int4_gptq(w, chunk_rows=128)
++    assert qweight.shape == (512 // 8, 300) and qweight.dtype == torch.int32
++    assert scales.shape == (512 // INT4_GROUP_SIZE, 300)
++    w_hat = dequantize_int4_gptq(qweight, scales)
++    step = scales.t().float().repeat_interleave(INT4_GROUP_SIZE, dim=1)
++    assert ((w_hat.float() - w.float()).abs() <= step / 2 + 1e-3).all()
++
++
++def test_int4_packing_is_low_nibble_first_uint4b8():
++    w = torch.zeros(1, INT4_GROUP_SIZE, dtype=torch.float16)
++    w[0, 0], w[0, 1], w[0, 7] = 7.0, -7.0, 1.0  # scale 1 -> codes 15, 1, 9
++    qweight, _ = quantize_int4_gptq(w)
++    word = int(qweight[0, 0]) & 0xFFFFFFFF
++    assert [(word >> (4 * i)) & 0xF for i in range(8)] == [15, 1, 8, 8, 8, 8, 8, 9]
++
++
++@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU W4A16 kernel")
++@pytest.mark.parametrize("num_tokens", [1, 5, 40])
++def test_int4_lm_head_kernel_matches_dequantized_reference(num_tokens):
++    torch.manual_seed(0)
++    vocab, hidden = 4096 + 64, 1024
++    w = (torch.randn(vocab, hidden, device="xpu") * 0.02).half()
++    x = torch.randn(num_tokens, hidden, device="xpu").half()
++    layer = torch.nn.Module()
++    method = _LMHeadInt4Method(layer, w)
++    out = method.apply(layer, x)
++    qweight, scales = quantize_int4_gptq(w)
++    ref = x.float() @ dequantize_int4_gptq(qweight, scales).float().t()
++    assert out.shape == (num_tokens, vocab)
++    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
++    agree = (out.float().argmax(-1) == ref.argmax(-1)).float().mean()
++    assert agree >= 0.95
 diff --git a/tests/v1/worker/test_mamba_hybrid_model_state.py b/tests/v1/worker/test_mamba_hybrid_model_state.py
 new file mode 100644
 index 000000000..42c4c7c9f
@@ -7254,10 +7311,23 @@ index 8875ed49f..171a12ab0 100644
  
      @staticmethod
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 8ba55a2ec..73dced75e 100644
+index 8ba55a2ec..8236501c8 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -877,7 +877,11 @@ class SpeculativeConfig:
+@@ -213,6 +213,12 @@ class SpeculativeConfig:
+     """Load config for the draft model. If not specified, will use the load
+     config from the target model."""
+ 
++    draft_lm_head_quantization: Literal["int4"] | None = None
++    """Quantize the drafter's copy of a target lm_head it shares (EAGLE and
++    MTP). "int4" is symmetric weight-only int4 (group 128) on the platform's
++    W4A16 mixed-precision kernel. The target verifies with its own head, so
++    only the acceptance length can change. Model Runner V2 only."""
++
+     rejection_sample_method: RejectionSampleMethod = "standard"
+     """The rejection sampling method to use. 'standard' uses probabilistic
+     rejection sampling (with or without cached draft logits, controlled by
+@@ -877,7 +883,11 @@ class SpeculativeConfig:
                      self.method = "eagle"
                  elif "eagle3" in self.draft_model_config.model.lower():
                      self.method = "eagle3"
@@ -7270,7 +7340,7 @@ index 8ba55a2ec..73dced75e 100644
                      self.method = "dflash"
                  elif (
                      "dspark" in self.draft_model_config.model.lower()
-@@ -1193,7 +1197,7 @@ class SpeculativeConfig:
+@@ -1193,7 +1203,7 @@ class SpeculativeConfig:
          This is mostly a copy of the target parallel config, except the tp_size.
          """
          draft_parallel_config = ParallelConfig(
@@ -7279,7 +7349,23 @@ index 8ba55a2ec..73dced75e 100644
              tensor_parallel_size=speculative_draft_tensor_parallel_size,
              distributed_executor_backend=target_parallel_config.distributed_executor_backend,
              max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
-@@ -1330,6 +1334,20 @@ class SpeculativeConfig:
+@@ -1234,6 +1244,15 @@ class SpeculativeConfig:
+                 f"than zero ({self.num_speculative_tokens})."
+             )
+ 
++        if self.draft_lm_head_quantization is not None and not (
++            self.method in ("eagle", "eagle3")
++            or self.method in get_args(MTPModelTypes)
++        ):
++            raise ValueError(
++                "draft_lm_head_quantization is not supported for method "
++                f"{self.method!r}."
++            )
++
+         if self.rejection_sample_method == "synthetic":
+             # Consolidate to per-position rates
+             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
+@@ -1330,6 +1349,20 @@ class SpeculativeConfig:
      def use_dflash(self) -> bool:
          return self.method == "dflash"
  
@@ -11763,6 +11849,147 @@ index 000000000..a5465c7d1
 +        output0.reshape(input.shape[:-1] + (output0.shape[-1],)),
 +        output1.reshape(input.shape[:-1] + (output1.shape[-1],)),
 +    )
+diff --git a/vllm/model_executor/layers/quantization/online/lm_head.py b/vllm/model_executor/layers/quantization/online/lm_head.py
+new file mode 100644
+index 000000000..00fc3483b
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/online/lm_head.py
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Online-quantized copies of an already-loaded lm_head (draft use only)."""
++
++from typing import Literal
++
++import torch
++from torch.nn import Module, Parameter
++
++from vllm.logger import init_logger
++from vllm.model_executor.kernels.linear import (
++    MPLinearLayerConfig,
++    choose_mp_linear_kernel,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++)
++from vllm.scalar_type import scalar_types
++
++logger = init_logger(__name__)
++
++INT4_GROUP_SIZE = 128
++
++
++def quantize_int4_gptq(
++    weight: torch.Tensor, group_size: int = INT4_GROUP_SIZE, chunk_rows: int = 8192
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Symmetric round-to-nearest int4 of the rows of `weight` [N, K].
++
++    Returns the GPTQ checkpoint layout the W4A16 kernels load: `qweight`
++    [K // 8, N] int32 (uint4b8 values packed along K, low nibble first) and
++    `scales` [K // group_size, N] in the weight dtype.
++    """
++    n, k = weight.shape
++    assert k % group_size == 0 and group_size % 8 == 0
++    qweight = torch.empty(n, k // 8, dtype=torch.int32, device=weight.device)
++    scales = torch.empty(n, k // group_size, dtype=weight.dtype, device=weight.device)
++    shifts = torch.arange(0, 32, 4, device=weight.device, dtype=torch.int64)
++    for start in range(0, n, chunk_rows):
++        rows = slice(start, start + chunk_rows)
++        w = weight[rows].float().reshape(-1, k // group_size, group_size)
++        s = (w.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-8)
++        q = (torch.round(w / s).clamp(-8, 7) + 8).to(torch.int64)
++        packed = (q.reshape(-1, k // 8, 8) << shifts).sum(dim=-1)
++        packed = torch.where(packed >= 2**31, packed - 2**32, packed)
++        qweight[rows] = packed.to(torch.int32)
++        scales[rows] = s.squeeze(-1).to(weight.dtype)
++    return qweight.t(), scales.t().contiguous()
++
++
++def dequantize_int4_gptq(
++    qweight: torch.Tensor, scales: torch.Tensor, group_size: int = INT4_GROUP_SIZE
++) -> torch.Tensor:
++    """Inverse of `quantize_int4_gptq`, returning the [N, K] weight."""
++    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
++    q = (qweight.t().unsqueeze(-1) >> shifts) & 0xF  # [N, K // 8, 8]
++    q = q.reshape(q.shape[0], -1).float() - 8
++    s = scales.t().float().repeat_interleave(group_size, dim=1)
++    return (q * s).to(scales.dtype)
++
++
++class _LMHeadInt4Method:
++    """Weight-only int4 lm_head on the platform's mixed-precision kernel."""
++
++    def __init__(self, layer: Module, weight: torch.Tensor) -> None:
++        n, k = weight.shape
++        config = MPLinearLayerConfig(
++            full_weight_shape=(k, n),
++            partition_weight_shape=(k, n),
++            weight_type=scalar_types.uint4b8,
++            act_type=weight.dtype,
++            group_size=INT4_GROUP_SIZE,
++            zero_points=False,
++            has_g_idx=False,
++        )
++        kernel_type = choose_mp_linear_kernel(config)
++        qweight, scales = quantize_int4_gptq(weight)
++        layer.register_parameter("qweight", Parameter(qweight, requires_grad=False))
++        layer.register_parameter("scales", Parameter(scales, requires_grad=False))
++        self.kernel = kernel_type(
++            config,
++            w_q_param_name="qweight",
++            w_s_param_name="scales",
++            w_zp_param_name="qzeros",
++            w_gidx_param_name="g_idx",
++        )
++        self.kernel.process_weights_after_loading(layer)
++        logger.info(
++            "Quantized an int4 copy of the lm_head (%d x %d per rank) with %s.",
++            n,
++            k,
++            kernel_type.__name__,
++        )
++
++    def apply(
++        self, layer: Module, x: torch.Tensor, bias: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        return self.kernel.apply_weights(layer, x, bias)
++
++
++def quantized_lm_head_copy(
++    lm_head: ParallelLMHead, quantization: Literal["int4"]
++) -> ParallelLMHead:
++    """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
++
++    `lm_head` is left unchanged and no bf16 copy of its weight is made.
++    """
++    if quantization != "int4":
++        raise ValueError(f"Unsupported lm_head quantization {quantization!r}.")
++    weight = lm_head.weight
++    if (
++        not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
++        or getattr(lm_head, "bias", None) is not None
++        or weight.dtype not in (torch.float16, torch.bfloat16)
++    ):
++        raise ValueError(
++            "Quantizing an lm_head copy needs an unquantized fp16/bf16 lm_head "
++            "without bias."
++        )
++    with torch.device("meta"):
++        head = ParallelLMHead(
++            lm_head.num_embeddings,
++            lm_head.embedding_dim,
++            params_dtype=weight.dtype,
++            org_num_embeddings=lm_head.org_vocab_size,
++            padding_size=lm_head.padding_size,
++            prefix=getattr(lm_head, "prefix", ""),
++        )
++    # Same vocab sharding as the source; only the weight representation differs.
++    head.shard_indices = lm_head.shard_indices
++    del head.weight
++    with torch.no_grad():
++        head.quant_method = _LMHeadInt4Method(head, weight.data)
++    return head
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
 index 000000000..94a6222b6
@@ -21591,18 +21818,22 @@ index 478274a05..b9e6ea02f 100644
  
      # Skip embedding sharing under PP — each rank owns its own embedding.
 diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-index 579652bc7..5a008b6f1 100644
+index 579652bc7..b0bf06508 100644
 --- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-@@ -7,6 +7,7 @@ from vllm.config import VllmConfig, replace
+@@ -6,7 +6,11 @@ import torch.nn as nn
+ from vllm.config import VllmConfig, replace
  from vllm.distributed.parallel_state import get_pp_group
  from vllm.lora.layers.base import BaseLayerWithLoRA
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    quantized_lm_head_copy,
++)
  from vllm.model_executor.model_loader import get_model
 +from vllm.model_executor.models.utils import PPMissingLayer
  
  
  def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
-@@ -60,11 +61,15 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+@@ -60,11 +64,15 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
      target_inner = target_language_model.model
      draft_inner = eagle_model.model
  
@@ -21623,6 +21854,35 @@ index 579652bc7..5a008b6f1 100644
          # If the target's embedding is LoRA-wrapped, share the underlying base
          # layer. The draft is not part of the LoRA adapter; sharing the wrapper
          # would make the draft run the LoRA embedding kernel with the target's
+@@ -85,9 +93,14 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+     if target_lm_head is not None and _should_share(
+         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
+     ):
++        draft_head = target_lm_head
++        if speculative_config.draft_lm_head_quantization is not None:
++            draft_head = quantized_lm_head_copy(
++                target_lm_head, speculative_config.draft_lm_head_quantization
++            )
+         if draft_lm_head is not None:
+             del eagle_model.lm_head
+-        eagle_model.lm_head = target_lm_head
++        eagle_model.lm_head = draft_head
+ 
+         # MTP layers route logits through layer.shared_head.head, not
+         # eagle_model.lm_head, so the per-layer copies need fixing up too.
+@@ -98,7 +111,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+                 sh = getattr(layer, "shared_head", None)
+                 if sh is not None and hasattr(sh, "head"):
+                     del sh.head
+-                    sh.head = target_lm_head
++                    sh.head = draft_head
++    elif speculative_config.draft_lm_head_quantization is not None:
++        raise ValueError(
++            "draft_lm_head_quantization needs a drafter that shares the target lm_head."
++        )
+ 
+     # MTP shares topk_indices_buffer with the target model. We update
+     # every module in the draft that holds a buffer reference so that
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index f3f0afb13..b587e3043 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
