@@ -7058,6 +7058,64 @@ index 000000000..d7ade31a3
 +    assert len(create_context.call_args_list) == 2
 +    for call in create_context.call_args_list:
 +        assert call.kwargs["additional_kwargs"] is additional_kwargs
+diff --git a/tests/v1/worker/test_xpu_tp_drafter_eager.py b/tests/v1/worker/test_xpu_tp_drafter_eager.py
+new file mode 100644
+index 000000000..1393e1c61
+--- /dev/null
++++ b/tests/v1/worker/test_xpu_tp_drafter_eager.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""On XPU with TP > 1 the MRV2 drafter must not capture graphs: oneCCL
++collectives replayed from the drafter's XPU graphs give wrong drafts and
++corrupt the target output."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as mod
++
++
++@pytest.fixture
++def captured_modes(monkeypatch):
++    modes = []
++
++    class FakeManager:
++        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_len):
++            modes.append(cudagraph_mode)
++
++    monkeypatch.setattr(mod, "SpeculatorCudaGraphManager", FakeManager)
++    return modes
++
++
++def _speculator(tp_size):
++    return SimpleNamespace(
++        vllm_config=SimpleNamespace(
++            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size)
++        ),
++        device="xpu",
++        num_speculative_steps=3,
++    )
++
++
++@pytest.mark.parametrize(
++    "is_xpu,tp_size,expect_eager",
++    [(True, 2, True), (True, 1, False), (False, 2, False)],
++)
++def test_drafter_graph_mode(monkeypatch, captured_modes, is_xpu, tp_size, expect_eager):
++    monkeypatch.setattr(mod.current_platform, "is_xpu", lambda: is_xpu)
++    mod.AutoRegressiveSpeculator.init_cudagraph_manager(
++        _speculator(tp_size), CUDAGraphMode.FULL_DECODE_ONLY
++    )
++    if expect_eager:
++        assert captured_modes == [CUDAGraphMode.NONE, CUDAGraphMode.NONE]
++    else:
++        assert captured_modes == [
++            CUDAGraphMode.FULL_DECODE_ONLY,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ]
 diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
 index 8875ed49f..171a12ab0 100644
 --- a/vllm/_xpu_ops.py
@@ -21467,6 +21525,34 @@ index 9b1786cbe..752dc59d6 100644
                  src=self.last_rank,
                  group=self.broadcast_group,
              )
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 3cb478348..92ea384f1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -9,6 +9,7 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+@@ -59,6 +60,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         return True
+ 
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
++        if (
++            current_platform.is_xpu()
++            and self.vllm_config.parallel_config.tensor_parallel_size > 1
++            and cudagraph_mode != CUDAGraphMode.NONE
++        ):
++            # Replaying TP collectives inside the drafter's XPU graphs gives
++            # wrong drafts and corrupts target output (oneCCL 2021.15).
++            logger.warning_once("XPU with TP > 1: running the drafter eagerly.")
++            cudagraph_mode = CUDAGraphMode.NONE
+         # Initialize cudagraph manager for draft prefill (draft position 0).
+         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+             self.vllm_config,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
 index 478274a05..b9e6ea02f 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
