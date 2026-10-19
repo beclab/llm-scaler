@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Overlay build of llm-scaler-vllm: takes a released image and replaces only
+# the vLLM Python files that differ between the multi-arc patch the image was
+# built from and the patch in this checkout.  No native code is rebuilt, so
+# the overlay is valid only when the patch delta is pure Python (the workflow
+# `.github/workflows/vllm-overlay-image.yml` checks that).
+#
+# Build context: a staging dir with
+#   overlay/vllm/...    changed files, laid out as in the vLLM source tree
+#   overlay/tests/...   changed tests (only copied into the source tree copy)
+#   OVERLAY_DELETED     paths deleted by the patch delta, one per line
+#   OVERLAY_COMMIT      provenance written into the image
+
+ARG BASE_IMAGE=intel/llm-scaler-vllm:0.26.0-b2
+FROM ${BASE_IMAGE}
+
+COPY overlay /tmp/overlay
+COPY OVERLAY_DELETED OVERLAY_COMMIT /tmp/
+
+RUN set -eux; \
+    site="$(python3 -c "import importlib.util; print(importlib.util.find_spec('vllm').submodule_search_locations[0])")"; \
+    cp -a /tmp/overlay/vllm/. "${site}/"; \
+    src=/llm-scaler/vllm/vllm; \
+    if [ -d "${src}/vllm" ]; then cp -a /tmp/overlay/. "${src}/"; fi; \
+    while read -r f; do \
+        [ -n "${f}" ] || continue; \
+        case "${f}" in vllm/*) rm -f "${site}/${f#vllm/}" ;; esac; \
+        if [ -d "${src}/vllm" ]; then rm -f "${src}/${f}"; fi; \
+    done < /tmp/OVERLAY_DELETED; \
+    cp /tmp/OVERLAY_COMMIT "${site}/OVERLAY_COMMIT"; \
+    find /tmp/overlay/vllm -name '*.py' -printf '%P\n' \
+        | sed "s|^|${site}/|" | xargs -r python3 -m py_compile; \
+    rm -rf /tmp/overlay /tmp/OVERLAY_DELETED /tmp/OVERLAY_COMMIT

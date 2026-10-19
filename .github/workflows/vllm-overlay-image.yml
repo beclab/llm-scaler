@@ -1,0 +1,88 @@
+name: vLLM overlay image
+
+# Builds llm-scaler-vllm as an overlay on a released image: only the vLLM
+# Python files changed by this branch's multi-arc patch (vs the patch the base
+# image was built from) are replaced.  See vllm/docker/Dockerfile.overlay.
+
+# workflow_dispatch only shows up once this file is on the default branch, so
+# pushes to b70/* branches that touch the patch also build with the defaults.
+on:
+  push:
+    branches: ['b70/**']
+    paths:
+      - vllm/patches/vllm_for_multi_arc.patch
+      - vllm/docker/Dockerfile.overlay
+      - vllm/docker/prepare_overlay.sh
+      - .github/workflows/vllm-overlay-image.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag (pushed as beclab/llm-scaler-vllm:<tag> and <tag>-<sha>)
+        default: 0.26.0-b2-pp-mtp
+      base_image:
+        description: Released image to overlay
+        default: intel/llm-scaler-vllm:0.26.0-b2
+      base_patch_ref:
+        description: llm-scaler commit whose multi-arc patch the base image was built from
+        default: 77c547307e0f0289044c8a610bd9603c19c2c483
+      vllm_version:
+        description: Upstream vLLM tag both patches apply to
+        default: v0.26.0
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: beclab/llm-scaler-vllm
+  TAG: ${{ inputs.tag || '0.26.0-b2-pp-mtp' }}
+  BASE_IMAGE: ${{ inputs.base_image || 'intel/llm-scaler-vllm:0.26.0-b2' }}
+  BASE_PATCH_REF: ${{ inputs.base_patch_ref || '77c547307e0f0289044c8a610bd9603c19c2c483' }}
+  VLLM_VERSION: ${{ inputs.vllm_version || 'v0.26.0' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stage overlay
+        run: |
+          git show "$BASE_PATCH_REF:vllm/patches/vllm_for_multi_arc.patch" > "$RUNNER_TEMP/base.patch"
+          vllm/docker/prepare_overlay.sh "$RUNNER_TEMP/base.patch" \
+            vllm/patches/vllm_for_multi_arc.patch "$VLLM_VERSION" "$RUNNER_TEMP/ctx"
+          cat > "$RUNNER_TEMP/ctx/OVERLAY_COMMIT" <<EOF
+          llm-scaler ${GITHUB_REF_NAME} ${GITHUB_SHA}
+          base image $BASE_IMAGE
+          base patch $BASE_PATCH_REF
+          vllm $VLLM_VERSION
+          EOF
+          cp vllm/docker/Dockerfile.overlay "$RUNNER_TEMP/ctx/Dockerfile"
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASS }}
+
+      - name: Build and push
+        run: |
+          cd "$RUNNER_TEMP/ctx"
+          docker build --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t "$IMAGE:$TAG" -t "$IMAGE:$TAG-$SHORT_SHA" .
+          docker run --rm --entrypoint bash "$IMAGE:$TAG" -c \
+            'cat "$(python3 -c "import importlib.util; print(importlib.util.find_spec(\"vllm\").submodule_search_locations[0])")/OVERLAY_COMMIT"'
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG-$SHORT_SHA"
+          df -h /
